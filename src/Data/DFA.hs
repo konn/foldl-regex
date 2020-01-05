@@ -3,35 +3,30 @@
 {-# LANGUAGE ScopedTypeVariables                                   #-}
 module Data.DFA where
 import           Control.Applicative
-import           Control.Arrow
-import qualified Control.Foldl             as L
-import           Control.Lens              hiding (from, to)
-import           Control.Monad
-import           Control.Monad.Trans.Maybe
+import qualified Control.Foldl       as L
+import           Control.Lens        hiding (from, to)
 import           Data.Hashable
-import qualified Data.HashMap.Lazy         as HM
-import qualified Data.HashSet              as HS
-import           Data.Maybe
+
 
 -- | Finite-automaton
 --   with state @q@ and alphabets @c@
 --   with @t@-many transition.
 data Automaton t q c =
-  FA  { trans     :: q -> HM.HashMap c (t q)
-      , accepteds :: HS.HashSet q
-      , initial   :: q
+  FA  { trans   :: q -> c -> t q
+      , accepts :: q -> Bool
+      , initial :: q
       }
 
 type DFA = Automaton Identity
 type NFA = Automaton []
 
 runAutomaton
-  :: (Monad t, Alternative t, Eq q, Hashable q, Eq c, Hashable c)
+  :: (Monad t, Eq q, Hashable q, Eq c, Hashable c)
   => Automaton t q c
   -> L.Fold c (t q)
 runAutomaton FA{..} = L.Fold step (pure initial) id
   where
-    step !qs !c = join . maybeToAlt . HM.lookup c . trans =<< qs
+    step !qs !c = flip trans c =<< qs
 
 invmapState
   :: (Functor t, Eq q', Hashable q')
@@ -42,7 +37,7 @@ invmapState
 invmapState to from FA{..} =
   FA  { initial = to initial
       , trans = fmap (fmap to) . trans . from
-      , accepteds = HS.map to accepteds
+      , accepts = accepts . from
       }
 
 maybeToAlt
@@ -53,26 +48,28 @@ isAccepted
   :: (Monad t, Eq q, Hashable q, Foldable t, Eq c, Hashable c)
   => Automaton t q c
   -> L.Fold c Bool
-isAccepted = (fmap <$> there . accepteds <*> runAutomaton)
-  . hoistFA (MaybeT . fmap Just)
-  where
-    {-# INLINE there #-}
-    there qs =
-      any (maybe False (`HS.member` qs)) . runMaybeT
+isAccepted = fmap <$> any . accepts <*> runAutomaton
 {-# INLINE isAccepted #-}
 
 addEpsilonMove
   :: (Eq c, Hashable c, Alternative f, Eq q, Hashable q)
   => q -> q -> Automaton f q c -> Automaton f q c
-addEpsilonMove from to fa@FA{..}
-  | from == to = fa
+addEpsilonMove from to
+  | from == to = id
+  | otherwise = addEpsilonMoveP (== from) to
+
+addEpsilonMoveP
+  :: (Eq c, Hashable c, Alternative f, Eq q, Hashable q)
+  => (q -> Bool) -> q -> Automaton f q c -> Automaton f q c
+addEpsilonMoveP isFrom to fa@FA{..}
+  | isFrom to = fa
   | otherwise =
-      let trans' q
-            | q == from = HM.unionWith (<|>) (trans q) (trans to)
-            | otherwise = trans q
-          fin | from `HS.member` accepteds = HS.insert from accepteds
-              | otherwise = accepteds
-      in FA{trans = trans', accepteds = fin, ..}
+      let trans' q c
+            | isFrom q = trans q c <|> trans to c
+            | otherwise = trans q c
+          fin | accepts to = \q -> isFrom q || accepts q
+              | otherwise = accepts
+      in FA{trans = trans', accepts = fin, ..}
 
 hoistFA
   :: (t q -> f q)
@@ -86,24 +83,20 @@ generalize
   :: Applicative t
   => DFA q c -> Automaton t q c
 generalize fa =
-  FA { accepteds = accepteds fa
+  FA { accepts = accepts fa
      , initial = initial fa
      , trans = fmap (pure . runIdentity) <$> trans fa
      }
 
 determinise
   :: forall t c q.
-      (Foldable t, Monad t, Hashable (t q))
-  => Automaton t c q -> DFA c (t q)
+      (Foldable t, Monad t, Hashable q)
+  => Automaton t q c -> DFA (t q) c
 determinise nfa =
-  FA { accepteds = any (accepteds nfa)
-     , trans = liftTq $ trans nfa
+  FA { accepts = any (accepts nfa)
+     , trans = \qs c -> Identity $ flip (trans nfa) c =<< qs
      , initial = pure $ initial nfa
      }
-  where
-    liftTq :: (q -> (HM.HashMap (Identity c) (t q)))
-           -> t q -> (HM.HashMap (Identity c) (t (t q)))
-    liftTq dic = _u
 
 -- removeEpsilonMove
 --   :: EpsilonAutomaton t c q -> Automaton Identity t c q
