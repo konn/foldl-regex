@@ -23,11 +23,12 @@ dependencies:
 - base >= 4.7 && < 5
 - foldl
 - unordered-containers
-- semiring-num
 - hashable
 - transformers
+- deepseq
 - mono-traversable
 - lens
+- MemoTrie
 - vector
 - containers
 

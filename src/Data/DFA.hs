@@ -1,12 +1,19 @@
-{-# LANGUAGE BangPatterns, DerivingStrategies, LiberalTypeSynonyms #-}
-{-# LANGUAGE NamedFieldPuns, RankNTypes, RecordWildCards           #-}
-{-# LANGUAGE ScopedTypeVariables                                   #-}
+{-# LANGUAGE BangPatterns, DerivingStrategies, FlexibleContexts, LambdaCase #-}
+{-# LANGUAGE LiberalTypeSynonyms, NamedFieldPuns, RankNTypes                #-}
+{-# LANGUAGE RecordWildCards, ScopedTypeVariables, TypeFamilies             #-}
+{-# LANGUAGE TypeOperators                                                  #-}
+{-# OPTIONS_GHC -Wno-orphans #-}
 module Data.DFA where
 import           Control.Applicative
-import qualified Control.Foldl       as L
-import           Control.Lens        hiding (from, to)
+import qualified Control.Foldl                    as L
+import           Control.Lens                     hiding (from, to)
+import           Control.Monad.Trans.State.Strict
 import           Data.Hashable
-
+import qualified Data.HashMap.Strict              as HM
+import qualified Data.HashSet                     as HS
+import           Data.Maybe
+import           Data.MemoTrie
+import           Data.Monoid                      (Ap (..))
 
 -- | Finite-automaton
 --   with state @q@ and alphabets @c@
@@ -28,6 +35,14 @@ runAutomaton FA{..} = L.Fold step (pure initial) id
   where
     step !qs !c = flip trans c =<< qs
 
+runAutomatonMemo
+  :: (Monad t, Eq q, Hashable q, Eq c, Hashable c, HasTrie (t q), HasTrie c)
+  => Automaton t q c
+  -> L.Fold c (t q)
+runAutomatonMemo FA{..} = L.Fold (memo2 step) (pure initial) id
+  where
+    step !qs !c = flip trans c =<< qs
+
 invmapState
   :: (Functor t, Eq q', Hashable q')
   => (q -> q')
@@ -40,6 +55,21 @@ invmapState to from FA{..} =
       , accepts = accepts . from
       }
 
+invmapEpsilon
+  :: (Eq q', Hashable q')
+  => (q -> q')
+  -> (q' -> q)
+  -> EpsilonNFA q  c
+  -> EpsilonNFA q' c
+invmapEpsilon to from EpsilonNFA{..} =
+  EpsilonNFA
+    { nfa = invmapState to from nfa
+    , epsilonMoves =
+        L.foldOver (ifolded.withIndex)
+          (lmap (\(k, hs) -> (to k, HS.map to hs) )
+          L.hashMap)
+        epsilonMoves
+    }
 maybeToAlt
   :: Alternative t => Maybe a -> t a
 maybeToAlt = maybe empty pure
@@ -51,25 +81,56 @@ isAccepted
 isAccepted = fmap <$> any . accepts <*> runAutomaton
 {-# INLINE isAccepted #-}
 
+instance HasTrie a => HasTrie (Identity a) where
+  newtype Identity a :->: b = IdTrie { runIdTrie :: Reg (Identity a) :->: b }
+  trie = trieGeneric IdTrie
+  untrie = untrieGeneric runIdTrie
+  enumerate = enumerateGeneric runIdTrie
+
+isAcceptedMemo
+  :: (Monad t, Eq q, HasTrie c, HasTrie (t q),
+      Hashable q, Foldable t, Eq c, Hashable c
+     )
+  => Automaton t q c
+  -> L.Fold c Bool
+isAcceptedMemo = fmap <$> memo . (any . accepts) <*> runAutomatonMemo
+{-# INLINE isAcceptedMemo #-}
+
+data EpsilonNFA q c =
+  EpsilonNFA
+    { nfa          :: NFA q c
+    , epsilonMoves :: HM.HashMap q (HS.HashSet q)
+    }
+
+epsilonClosure
+  :: (Eq q, Hashable q)
+  => EpsilonNFA q c -> q -> HS.HashSet q
+epsilonClosure EpsilonNFA{..} =
+  HS.fromList . closure (fromMaybe HS.empty . (`HM.lookup` epsilonMoves))
+
+closure :: (Eq a, Hashable a, Foldable t) => (a -> t a) -> a -> [a]
+closure f = flip evalState HS.empty . loop
+  where
+    loop a = do
+      hset <- get
+      if HS.member a hset
+      then pure []
+      else do
+        modify $ HS.insert a
+        (a :) <$> getAp (foldMap (Ap . loop) (f a))
+
 addEpsilonMove
-  :: (Eq c, Hashable c, Alternative f, Eq q, Hashable q)
-  => q -> q -> Automaton f q c -> Automaton f q c
+  :: (Eq c, Hashable c, Eq q, Hashable q)
+  => q -> q -> EpsilonNFA q c -> EpsilonNFA q c
 addEpsilonMove from to
   | from == to = id
-  | otherwise = addEpsilonMoveP (== from) to
-
-addEpsilonMoveP
-  :: (Eq c, Hashable c, Alternative f, Eq q, Hashable q)
-  => (q -> Bool) -> q -> Automaton f q c -> Automaton f q c
-addEpsilonMoveP isFrom to fa@FA{..}
-  | isFrom to = fa
-  | otherwise =
-      let trans' q c
-            | isFrom q = trans q c <|> trans to c
-            | otherwise = trans q c
-          fin | accepts to = \q -> isFrom q || accepts q
-              | otherwise = accepts
-      in FA{trans = trans', accepts = fin, ..}
+  | otherwise = \EpsilonNFA{..} ->
+      EpsilonNFA
+        { epsilonMoves =
+            HM.insertWith HS.union from (HS.singleton to)
+            epsilonMoves
+        , ..
+        }
 
 hoistFA
   :: (t q -> f q)
@@ -98,6 +159,12 @@ determinise nfa =
      , initial = pure $ initial nfa
      }
 
--- removeEpsilonMove
---   :: EpsilonAutomaton t c q -> Automaton Identity t c q
--- removeEpsilonMove = undefined
+removeEpsilonMoves
+  :: (Hashable q, Eq q) => EpsilonNFA q c -> NFA q c
+removeEpsilonMoves ena@EpsilonNFA{..} =
+  let trans' = fmap HS.toList
+              . foldMap (fmap HS.fromList . trans nfa)
+              . epsilonClosure ena
+  in nfa { trans = trans'
+         , accepts = any (accepts nfa) . epsilonClosure ena
+         }
