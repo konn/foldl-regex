@@ -26,7 +26,6 @@ dependencies:
 - hashable
 - transformers
 - deepseq
-- regex-applicative
 - mono-traversable
 - lens
 - MemoTrie
